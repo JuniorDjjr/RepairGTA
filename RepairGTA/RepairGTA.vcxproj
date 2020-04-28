@@ -96,7 +96,7 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='GTASA Release|Win32'">
-    <OutDir>C:\Users\JuniorDjjr\Documents\GTA San Andreas\</OutDir>
+    <OutDir>G:\GTA San Andreas\</OutDir>
     <IntDir>$(ProjectDir).obj\GTASA\Release\</IntDir>
     <TargetName>RepairGTA.SA</TargetName>
     <TargetExt>.asi</TargetExt>
