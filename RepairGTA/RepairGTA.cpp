@@ -2,13 +2,21 @@
 #include "CRadar.h"
 #include "TestCheat.h"
 #include "CTheCarGenerators.h"
+#include "..\injector\assembly.hpp"
 
 using namespace plugin;
 using namespace std;
+using namespace injector;
 
 fstream lg;
 
+bool lastLoadedObjectDidntExist = false;
+bool lastLoadedObjectDidntExistCheck = true;
+int lastLoadedObjectWithWrongModel = -1;
 int runOnceProcessingScriptsCounter = 0;
+int maxDffIndex = 20000;
+uintptr_t ORIGINAL_CWorld__Add = 0;
+uintptr_t ORIGINAL_LoadObjectPool_CObjectConstructor = 0;
 
 // Radar icons
 tRadarTrace *radarTracesArray;
@@ -20,6 +28,50 @@ uint16_t carGeneratorTotal = 0;
 
 CdeclEvent <AddressList<0x5D14D5, H_CALL>, PRIORITY_BEFORE, ArgPickNone, void()> savingEvent;
 CdeclEvent <AddressList<0x5D19CE, H_CALL>, PRIORITY_AFTER, ArgPickNone, void()> loadingEvent;
+//CdeclEvent <AddressList<0x53C6DB, H_CALL>, PRIORITY_AFTER, ArgPickNone, void()> restartEvent;
+
+CObject* __fastcall Custom_LoadObjectPool_CObjectConstructor(CObject* _this, int a2, char a3)
+{
+	return plugin::CallMethodAndReturnDynGlobal<CObject*, CObject, int, int, char>(ORIGINAL_LoadObjectPool_CObjectConstructor, *_this, 0, a2, a3);
+	//return _this->Create(a2);
+}
+
+void __cdecl Custom_CWorld__Add(CEntity* entity)
+{
+	if (lastLoadedObjectDidntExist)
+	{
+		lg << "Objects: This model isn't installed. Deleted to fix game crash: " << lastLoadedObjectWithWrongModel << endl;
+		lastLoadedObjectDidntExistCheck = true;
+		CObject* obj = reinterpret_cast<CObject*>(entity);
+		delete obj;
+	}
+	else
+	{
+		plugin::CallDynGlobal<CEntity*>(ORIGINAL_CWorld__Add, entity);
+	}
+}
+
+bool ModelExists(int model) {
+	if (model >= maxDffIndex || model <= 0 || plugin::CallAndReturn<bool, 0x407800, int>(model) == false) {
+		return false;
+	}
+	return true;
+}
+
+int GetAvailableDummyModel() {
+	if (ModelExists(1559)) return 1559; // diamond, safe because even total conversions didn't remove it and game system itself uses it
+	if (ModelExists(1277)) return 1277; // save pickup, safe because even total conversions didn't remove it
+	if (ModelExists(1000)) return 1000; // tuning spoiler, safe because even total conversions didn't remove it
+	if (ModelExists(1599)) return 1599; // a fish, safe because even total conversions didn't remove it and game system itself uses i
+	// almost impossible, but if not found, search manually on every map model ID
+	for (int i = 4000; i < 10000; ++i) {
+		if (ModelExists(i)) return i;
+	}
+	if (ModelExists(346)) return 346; // pistol, safe but not totally (near peds ids, maybe total conversion change it)
+	if (ModelExists(712)) return 712; // a tree, safe but not totally (near vehicles ids, maybe total conversion change it)
+	// I give it up, just crashes it
+	return 0;
+}
 
 class RepairGTA
 {
@@ -28,10 +80,47 @@ public:
 	{
 		// Mod stuff
 		lg.open("RepairGTA.log", fstream::out | fstream::trunc);
-		lg << "Build 2" << endl;
+		lg << "Version: Build 3" << endl;
 		lg.flush();
 
 		///////////////////////////////////////////////
+
+		maxDffIndex = ReadMemory<int>(0x407104 + 2, true);
+		if (maxDffIndex < 1000) maxDffIndex = 20000;
+		ORIGINAL_LoadObjectPool_CObjectConstructor = ReadMemory<uintptr_t>(0x5D4AEC + 1, true);
+		ORIGINAL_LoadObjectPool_CObjectConstructor += (GetGlobalAddress(0x5D4AEC) + 5);
+
+		// What we do here:
+		// Give a temp dummy model ID if loaded object didn't exist
+		// Make the game keep loading that object, so it is not intrusive
+		// Instead of add the object to the world, patch it to delete it
+		// But also do a check to see if the object is being really removed
+		MakeInline<0x5D4A8C, 0x5D4A8C + 6>([](injector::reg_pack& regs)
+		{
+			regs.edx = *(uintptr_t*)0xB7449C; //mov     edx, _ZN6CPools14ms_pObjectPoolE ; CPools::ms_pObjectPool
+			if (!lastLoadedObjectDidntExistCheck) {
+				return;
+			}
+			int modelIndex = *(int*)(regs.esp + 0x60 - 0x3C);
+			// Check model exists
+			if (ModelExists(modelIndex) == false) {
+				
+				*(int*)(regs.esp + 0x60 - 0x3C) = GetAvailableDummyModel();
+				// after load, delete it instead of add to the world
+				lastLoadedObjectDidntExist = true;
+				lastLoadedObjectWithWrongModel = modelIndex;
+				// flag to check if the delete was a sucess, if not (some other mod patched my call), keep doing this, it's better to just crash the game instead of corrupt the saved game with a lot of dummy objects
+				lastLoadedObjectDidntExistCheck = false;
+			}
+			else {
+				lastLoadedObjectDidntExist = false;
+				lastLoadedObjectWithWrongModel = -1;
+			}
+		});
+
+		ORIGINAL_CWorld__Add = ReadMemory<uintptr_t>(0x5D4B1D + 1, true);
+		ORIGINAL_CWorld__Add += (GetGlobalAddress(0x5D4B1D) + 5);
+		patch::RedirectCall(0x5D4B1D, Custom_CWorld__Add);
 
 		Events::initScriptsEvent += []
 		{
@@ -43,13 +132,13 @@ public:
 
 		savingEvent += []
 		{
-			lg << "Saving" << endl;
+			lg << "Before Saving" << endl;
 			RunFixes();
 		};
 
 		loadingEvent += []
 		{
-			lg << "Loading" << endl;
+			lg << "After Loading" << endl;
 			runOnceProcessingScriptsCounter = 1;
 		};
 
@@ -60,18 +149,27 @@ public:
 			{
 				CVector2D playerPos = FindPlayerPed(-1)->GetPosition();
 				CVector2D blipPos;
+				int closestObject = -1;
+				float closestDistance = 999999.0f;
 				for (unsigned int i = 0; i < radarTracesTotal; i++)
 				{
-					if (radarTracesArray[i].m_bTrackingBlip && DistanceBetweenPoints(playerPos, radarTracesArray[i].m_vPosition) < 10.0f)
+					if (radarTracesArray[i].m_bTrackingBlip)
 					{
-						lg << "Radar Icons: Manually deleted, with type: " << (int)radarTracesArray[i].m_nBlipType <<
-							" x: " << radarTracesArray[i].m_vPosition.x <<
-							" y: " << radarTracesArray[i].m_vPosition.y <<
-							" z: " << radarTracesArray[i].m_vPosition.z << endl;
-						CRadar::ClearActualBlip(i);
+						float distance = DistanceBetweenPoints(playerPos, radarTracesArray[i].m_vPosition);
+						if (distance < 10.0f && distance < closestDistance) {
+							closestDistance = distance;
+							closestObject = i;
+						}
 					}
 				}
-				lg.flush();
+				if (closestObject > -1)
+				{
+					lg << "Radar Icons: Manually deleted, with type: " << (int)radarTracesArray[closestObject].m_nBlipType <<
+						" x: " << radarTracesArray[closestObject].m_vPosition.x <<
+						" y: " << radarTracesArray[closestObject].m_vPosition.y <<
+						" z: " << radarTracesArray[closestObject].m_vPosition.z << endl;
+					CRadar::ClearActualBlip(closestObject);
+				}
 			}
 
 			// Run after first process
